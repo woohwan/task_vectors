@@ -47,16 +47,25 @@ class TaskVector():
         return TaskVector(vector=new_vector)
 
     def apply_to(self, pretrained_checkpoint, scaling_coef=1.0):
-        """Apply a task vector to a pretrained model."""
+        """Apply a task vector to specific layers of a pretrained model."""
         with torch.no_grad():
             pretrained_model = torch.load(pretrained_checkpoint)
             new_state_dict = {}
             pretrained_state_dict = pretrained_model.state_dict()
+            
             for key in pretrained_state_dict:
-                if key not in self.vector:
-                    print(f'Warning: key {key} is present in the pretrained state dict but not in the task vector')
-                    continue
-                new_state_dict[key] = pretrained_state_dict[key] + scaling_coef * self.vector[key]
-        pretrained_model.load_state_dict(new_state_dict, strict=False)
+                # 'layers'에 해당하는 키만 처리하고, 'embed_tokens'와 'lm_head'는 제외
+                if 'layers' in key and 'embed_tokens' not in key and 'lm_head' not in key:
+                    if key not in self.vector:
+                        print(f'Warning: key {key} is present in the pretrained state dict but not in the task vector')
+                        new_state_dict[key] = pretrained_state_dict[key]
+                    else:
+                        new_state_dict[key] = pretrained_state_dict[key] + scaling_coef * self.vector[key]
+                else:
+                    # 'layers'에 해당하지 않거나 'embed_tokens' 또는 'lm_head'인 경우 그대로 유지
+                    new_state_dict[key] = pretrained_state_dict[key]
+        
+            pretrained_model.load_state_dict(new_state_dict, strict=False)
         return pretrained_model
+
 
