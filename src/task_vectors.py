@@ -1,71 +1,114 @@
 import torch
+from transformers import AutoModelForCausalLM
+from typing import Optional, Union, List, Dict, Any
 
+class TaskVector:
+    def __init__(self, pretrained_model: Optional[Union[str, AutoModelForCausalLM]] = None,
+                 finetuned_model: Optional[Union[str, AutoModelForCausalLM]] = None,
+                 vector: Optional[Dict[str, torch.Tensor]] = None):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-class TaskVector():
-    def __init__(self, pretrained_checkpoint=None, finetuned_checkpoint=None, vector=None):
-        """Initializes the task vector from a pretrained and a finetuned checkpoints.
-        
-        This can either be done by passing two state dicts (one corresponding to the
-        pretrained model, and another to the finetuned model), or by directly passying in
-        the task vector state dict.
-        """
         if vector is not None:
-            self.vector = vector
+            self.vector = {k: v.to(self.device) for k, v in vector.items()}
         else:
-            assert pretrained_checkpoint is not None and finetuned_checkpoint is not None
+            if pretrained_model is None or finetuned_model is None:
+                raise ValueError("Both pretrained and finetuned models must be provided if vector is not given.")
+            
             with torch.no_grad():
-                pretrained_state_dict = torch.load(pretrained_checkpoint).state_dict()
-                finetuned_state_dict = torch.load(finetuned_checkpoint).state_dict()
-                self.vector = {}
-                for key in pretrained_state_dict:
-                    if pretrained_state_dict[key].dtype in [torch.int64, torch.uint8]:
-                        continue
-                    self.vector[key] = finetuned_state_dict[key] - pretrained_state_dict[key]
-    
-    def __add__(self, other):
-        """Add two task vectors together."""
+                pretrained_model = self._load_model(pretrained_model)
+                finetuned_model = self._load_model(finetuned_model)
+
+                pretrained_state_dict = pretrained_model.state_dict()
+                finetuned_state_dict = finetuned_model.state_dict()
+
+                if pretrained_state_dict.keys() != finetuned_state_dict.keys():
+                    raise RuntimeError("Mismatch in model architectures. Ensure both models are of the same type.")
+
+                self.vector = {
+                    key: (finetuned_state_dict[key] - pretrained_state_dict[key]).to(self.device)
+                    for key in pretrained_state_dict
+                    if pretrained_state_dict[key].dtype not in [torch.int64, torch.uint8]
+                }
+
+    def _load_model(self, model: Union[str, AutoModelForCausalLM]) -> AutoModelForCausalLM:
+        if isinstance(model, str):
+            return AutoModelForCausalLM.from_pretrained(model).to(self.device)
+        return model.to(self.device)
+
+    def __add__(self, other: 'TaskVector') -> 'TaskVector':
+        if not isinstance(other, TaskVector):
+            raise TypeError(f"Unsupported operand type for +: 'TaskVector' and '{type(other).__name__}'")
+        
+        if set(self.vector.keys()) != set(other.vector.keys()):
+            raise ValueError("The two TaskVectors have different key sets.")
+        
         with torch.no_grad():
-            new_vector = {}
-            for key in self.vector:
-                if key not in other.vector:
-                    print(f'Warning, key {key} is not present in both task vectors.')
-                    continue
-                new_vector[key] = self.vector[key] + other.vector[key]
+            new_vector = {key: self.vector[key] + other.vector[key] for key in self.vector}
         return TaskVector(vector=new_vector)
 
-    def __radd__(self, other):
-        if other is None or isinstance(other, int):
+    def __radd__(self, other: Union[int, 'TaskVector']) -> 'TaskVector':
+        if isinstance(other, int):
             return self
         return self.__add__(other)
 
-    def __neg__(self):
-        """Negate a task vector."""
+    def __neg__(self) -> 'TaskVector':
         with torch.no_grad():
-            new_vector = {}
-            for key in self.vector:
-                new_vector[key] = - self.vector[key]
+            new_vector = {key: -value for key, value in self.vector.items()}
         return TaskVector(vector=new_vector)
 
-    def apply_to(self, pretrained_checkpoint, scaling_coef=1.0):
-        """Apply a task vector to specific layers of a pretrained model."""
-        with torch.no_grad():
-            pretrained_model = torch.load(pretrained_checkpoint)
-            new_state_dict = {}
-            pretrained_state_dict = pretrained_model.state_dict()
-            
-            for key in pretrained_state_dict:
-                # 'layers'에 해당하는 키만 처리하고, 'embed_tokens'와 'lm_head'는 제외
-                if 'layers' in key and 'embed_tokens' not in key and 'lm_head' not in key:
-                    if key not in self.vector:
-                        print(f'Warning: key {key} is present in the pretrained state dict but not in the task vector')
-                        new_state_dict[key] = pretrained_state_dict[key]
-                    else:
-                        new_state_dict[key] = pretrained_state_dict[key] + scaling_coef * self.vector[key]
-                else:
-                    # 'layers'에 해당하지 않거나 'embed_tokens' 또는 'lm_head'인 경우 그대로 유지
-                    new_state_dict[key] = pretrained_state_dict[key]
+    def save(self, path: str) -> None:
+        if not path.endswith('.pt'):
+            path += '.pt'
+        torch.save(self.vector, path)
+
+    @classmethod
+    def load(cls, path: str) -> 'TaskVector':
+        if not path.endswith('.pt'):
+            path += '.pt'
+        vector = torch.load(path, map_location=torch.device('cpu'))
+        return cls(vector=vector)
+
+    def get_metadata(self) -> Dict[str, Any]:
+        return {
+            "keys": list(self.vector.keys()),
+            "shapes": {k: list(v.shape) for k, v in self.vector.items()},
+            "dtypes": {k: str(v.dtype) for k, v in self.vector.items()}
+        }
+
+    def apply_to(self, model: Union[str, AutoModelForCausalLM],
+                 apply_layers: Optional[List[str]] = None,
+                 exclude_layers: Optional[List[str]] = None,
+                 scaling_coef: float = 1.0) -> AutoModelForCausalLM:
+        if apply_layers and exclude_layers:
+            raise ValueError("Cannot specify both apply_layers and exclude_layers.")
+
+        if scaling_coef == 0:
+            return model  # If scaling_coef is 0, no changes are needed
+
+        model = self._load_model(model)
         
-            pretrained_model.load_state_dict(new_state_dict, strict=False)
-        return pretrained_model
+        with torch.no_grad():
+            for key in model.state_dict():
+                if key in self.vector:
+                    if self._should_apply_vector(key, apply_layers, exclude_layers):
+                        try:
+                            param = model.state_dict()[key]
+                            param += scaling_coef * self.vector[key].to(param.device)
+                        except KeyError as e:
+                            raise KeyError(f"Key '{key}' not found in the model state dictionary.") from e
+                        except RuntimeError as e:
+                            raise RuntimeError(f"Error applying TaskVector to key '{key}': {str(e)}") from e
+        
+        return model
 
+    def _should_apply_vector(self, key: str, apply_layers: Optional[List[str]], exclude_layers: Optional[List[str]]) -> bool:
+        if apply_layers:
+            return any(layer in key for layer in apply_layers)
+        if exclude_layers:
+            return all(layer not in key for layer in exclude_layers)
+        return True
 
+    def to(self, device: torch.device) -> 'TaskVector':
+        self.vector = {k: v.to(device) for k, v in self.vector.items()}
+        self.device = device
+        return self
